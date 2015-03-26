@@ -5,4 +5,5 @@ api_version: go1
 
 handlers:
 - url: /.*
+  secure: always
   script: _go_app

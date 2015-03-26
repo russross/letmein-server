@@ -254,7 +254,7 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		sync.AccessCount++
 
 		// no action required?
-		if len(client.Profiles) == 0 && client.PreviousSyncAt.After(sync.ModifiedAt) {
+		if len(client.Profiles) == 0 && client.PreviousSyncAt != nil && client.PreviousSyncAt.After(sync.ModifiedAt) {
 			// write back the sync record and quit
 			if _, err := datastore.Put(c, syncKey, sync); err != nil {
 				c.Errorf("DB error putting client sync record: %v", err)
@@ -267,6 +267,7 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 			client.SyncedAt = nil
 			client.PreviousSyncAt = &now
 
+			c.Infof("simple sync was sufficient; skipping check of all profiles")
 			return nil
 		}
 
@@ -394,6 +395,8 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 				c.Errorf("DB error putting profiles: %v", err)
 				return err
 			}
+		} else {
+			c.Infof("no changes to profile list; skipping profile write")
 		}
 
 		// prepare client result
