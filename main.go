@@ -159,6 +159,7 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		if elt.ModifiedAt.After(now) {
 			elt.ModifiedAt = &now
 		}
+		elt.SyncedAt = now
 
 		if err := elt.Validate(); err != nil {
 			ctx.Errorf("Invalid profile %s: %v", elt, err)
@@ -266,6 +267,9 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 			clientMap[p.UUID] = p
 		}
 		for _, p := range server.Profiles {
+			if p.SyncedAt.Before(sync.CreatedAt) && p.ModifiedAt != nil {
+				p.SyncedAt = *p.ModifiedAt
+			}
 			if !uuidmap[p.UUID] {
 				uuidmap[p.UUID] = true
 				uuids = append(uuids, p.UUID)
@@ -294,9 +298,9 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 				merged = ps
 
 				// should we send this to the client?
-				if client.PreviousSyncAt == nil || merged.ModifiedAt.After(*client.PreviousSyncAt) {
+				if client.PreviousSyncAt == nil || merged.SyncedAt.After(*client.PreviousSyncAt) {
 					// exception: skip delete records for new clients
-					if merged.Length > 0 || client.PreviousSyncAt != nil {
+					if !merged.IsDeleted() || client.PreviousSyncAt != nil {
 						c.Infof("client getting new profile: %s", merged)
 						clientResult = append(clientResult, merged)
 					}
@@ -305,7 +309,6 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 			case ps == nil:
 				// server missing this profile
 				merged = pc
-				//merged.ModifiedAt = &now
 				modified = true
 				c.Infof("server getting new profile: %s", merged)
 
@@ -313,7 +316,6 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 				// both have the profile
 				if ps.Length > 0 && pc.ModifiedAt.After(*ps.ModifiedAt) {
 					merged = pc
-					//merged.ModifiedAt = &now
 					modified = true
 					c.Infof("server getting updated profile: %s", merged)
 				} else {
@@ -324,10 +326,10 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			serverResult = append(serverResult, merged)
-			if merged.Length > 0 {
-				count++
-			} else {
+			if merged.IsDeleted() {
 				deletedCount++
+			} else {
+				count++
 			}
 		}
 
