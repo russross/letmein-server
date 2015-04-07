@@ -21,7 +21,7 @@ func init() {
 }
 
 const (
-	maxClockDrift        = time.Hour
+	maxClockDrift        = 7 * 24 * time.Hour
 	maxVerifyLen         = 32
 	deletedRecordTimeout = time.Hour * 24 * 365
 )
@@ -42,7 +42,6 @@ type Client struct {
 	Verify   string     `json:"verify" datastore:"-"`
 	Profiles []*Profile `json:"profiles,omitempty" datastore:"profiles,noindex"`
 
-	ModifiedAt     *time.Time `json:"modified_at,omitempty" datastore:"-"`
 	SyncedAt       *time.Time `json:"synced_at,omitempty" datastore:"-"`
 	PreviousSyncAt *time.Time `json:"previous_sync_at,omitempty" datastore:"-"`
 }
@@ -93,53 +92,6 @@ func (elt *Client) Save(c chan<- datastore.Property) error {
 	return nil
 }
 
-type Profile struct {
-	UUID        string    `json:"uuid"`
-	Name        string    `json:"name,omitempty"`
-	Username    string    `json:"username,omitempty"`
-	URL         string    `json:"url,omitempty"`
-	Generation  int       `json:"generation,omitempty"`
-	Length      int       `json:"length,omitempty"`
-	Lower       bool      `json:"lower,omitempty"`
-	Upper       bool      `json:"upper,omitempty"`
-	Digits      bool      `json:"digits,omitempty"`
-	Punctuation bool      `json:"punctuation,omitempty"`
-	Spaces      bool      `json:"spaces,omitempty"`
-	Include     string    `json:"include,omitempty"`
-	Exclude     string    `json:"exclude,omitempty"`
-	ModifiedAt  time.Time `json:"modified_at"`
-}
-
-func (p *Profile) String() string {
-	if p.Length == 0 {
-		return "[deleted]"
-	}
-
-	charset := ""
-	if p.Lower {
-		charset += "a–z"
-	}
-	if p.Upper {
-		charset += "A–Z"
-	}
-	if p.Digits {
-		charset += "0–9"
-	}
-	if p.Punctuation {
-		charset += "[punct]"
-	}
-	if p.Spaces {
-		charset += "[space]"
-	}
-	if p.Include != "" {
-		charset += "+[" + p.Include + "]"
-	}
-	if p.Exclude != "" {
-		charset += "-[" + p.Exclude + "]"
-	}
-	return fmt.Sprintf("[%s] user:%s gen:%d len:%d chars:%s", p.URL, p.Username, p.Generation, p.Length, charset)
-}
-
 var never = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 
 func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
@@ -152,16 +104,18 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request Content-Type must be application/json", http.StatusBadRequest)
 		return
 	}
+	if !strings.Contains(r.Header.Get("Accept"), "application/json") {
+		ctx.Errorf("Accept header must include application/json")
+		http.Error(w, "Accept header must include application/json", http.StatusBadRequest)
+		return
+	}
 	client := new(Client)
 	decoder := json.NewDecoder(r.Body)
 	defer r.Body.Close()
 	if err := decoder.Decode(client); err != nil {
 		ctx.Errorf("decoding request: %v", err)
-		http.Error(w, "error decoding request", http.StatusBadRequest)
+		http.Error(w, "error decoding request: "+err.Error(), http.StatusBadRequest)
 		return
-	}
-	if client.ModifiedAt != nil {
-		*client.ModifiedAt = client.ModifiedAt.Round(time.Millisecond)
 	}
 	if client.SyncedAt == nil {
 		client.SyncedAt = &now
@@ -189,34 +143,32 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// adjust all client-supplied timestamps
 		ctx.Infof("delta %v\n", delta)
-		if client.ModifiedAt != nil {
-			*client.ModifiedAt = client.ModifiedAt.Add(delta)
-		}
-		*client.SyncedAt = client.SyncedAt.Add(delta)
-		// client.PreviousSyncAt came from us, so do not adjust it
-		for _, elt := range client.Profiles {
-			elt.ModifiedAt = elt.ModifiedAt.Add(delta)
-		}
 	}
 
+	// client.PreviousSyncAt came from us, so do not adjust it
+	*client.SyncedAt = client.SyncedAt.Add(delta)
+
 	// clean up profiles
+	var modifiedAt *time.Time
 	for _, elt := range client.Profiles {
-		// round all client-supplied timestamps
-		elt.ModifiedAt = elt.ModifiedAt.Round(time.Millisecond)
-		if elt.Length <= 0 {
-			// deleted record
-			elt.Name = ""
-			elt.Username = ""
-			elt.URL = ""
-			elt.Generation = 0
-			elt.Length = 0
-			elt.Lower = false
-			elt.Upper = false
-			elt.Digits = false
-			elt.Punctuation = false
-			elt.Spaces = false
-			elt.Include = ""
-			elt.Exclude = ""
+		if elt.ModifiedAt == nil {
+			elt.ModifiedAt = &never
+		} else {
+			*elt.ModifiedAt = elt.ModifiedAt.Add(delta)
+		}
+		if elt.ModifiedAt.After(now) {
+			elt.ModifiedAt = &now
+		}
+
+		if err := elt.Validate(); err != nil {
+			ctx.Errorf("Invalid profile %s: %v", elt, err)
+			http.Error(w, fmt.Sprintf("Invalid profile: %s: %v", elt, err), http.StatusBadRequest)
+			return
+		}
+
+		// find the latest timestamp
+		if modifiedAt == nil || modifiedAt.Before(*elt.ModifiedAt) {
+			modifiedAt = elt.ModifiedAt
 		}
 	}
 
@@ -232,6 +184,12 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// special case: new client
+			// if this is not a first sync, reject the request
+			if client.PreviousSyncAt != nil {
+				c.Infof("No client record found, but client is reporting an earlier sync. Rejecting request.")
+				return fmt.Errorf("Client record not found, but your request was for a partial sync")
+			}
+
 			c.Infof("new client sync record")
 			sync = &SyncRecord{
 				Verify:       client.Verify,
@@ -263,7 +221,6 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 
 			// tell the client not to make any changes
 			client.Profiles = []*Profile{}
-			client.ModifiedAt = nil
 			client.SyncedAt = nil
 			client.PreviousSyncAt = &now
 
@@ -348,15 +305,15 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 			case ps == nil:
 				// server missing this profile
 				merged = pc
-				merged.ModifiedAt = now
+				//merged.ModifiedAt = &now
 				modified = true
 				c.Infof("server getting new profile: %s", merged)
 
 			default:
 				// both have the profile
-				if ps.Length > 0 && pc.ModifiedAt.After(ps.ModifiedAt) {
+				if ps.Length > 0 && pc.ModifiedAt.After(*ps.ModifiedAt) {
 					merged = pc
-					merged.ModifiedAt = now
+					//merged.ModifiedAt = &now
 					modified = true
 					c.Infof("server getting updated profile: %s", merged)
 				} else {
@@ -364,9 +321,6 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 					clientResult = append(clientResult, merged)
 					c.Infof("client getting updated profile: %s", merged)
 				}
-			}
-			if merged.ModifiedAt.After(now) {
-				merged.ModifiedAt = now
 			}
 
 			serverResult = append(serverResult, merged)
@@ -400,26 +354,39 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// prepare client result
-		client.ModifiedAt = nil
 		client.SyncedAt = nil
 		client.PreviousSyncAt = &now
 		client.Profiles = clientResult
 		for _, elt := range client.Profiles {
-			elt.ModifiedAt = now
+			elt.ModifiedAt = &now
 		}
 
 		return nil
 	}, topts)
 	if err != nil {
 		ctx.Errorf("Error in syncNoAuthHandler transaction: %v", err)
-		http.Error(w, "error handling sync", http.StatusInternalServerError)
+		http.Error(w, "error handling sync: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// write out the JSON response
 	w.Header().Add("Content-Type", "application/json")
-	encoder := json.NewEncoder(w)
-	if err := encoder.Encode(client); err != nil {
-		ctx.Errorf("Error writing/encoding response: %v", err)
+	encoded, err := json.MarshalIndent(client, "", "    ")
+	if err != nil {
+		ctx.Errorf("Error encoding JSON response: %v", err)
+		http.Error(w, "Error encoding JSON response: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
+	encoded = append(encoded, '\n')
+	if _, err = w.Write(encoded); err != nil {
+		ctx.Errorf("Error writing response: %v", err)
+		http.Error(w, "Error writing response: "+err.Error(), http.StatusInternalServerError)
+	}
+
+	/*
+		encoder := json.NewEncoder(w)
+		if err := encoder.Encode(client); err != nil {
+			ctx.Errorf("Error writing/encoding response: %v", err)
+		}
+	*/
 }
