@@ -1,9 +1,14 @@
 application: letmein-app
 version: 1
+threadsafe: true
 runtime: go
 api_version: go1
 
 handlers:
-- url: /.*
+- url: /api/v1noauth/.*
+  secure: always
+  script: _go_app
+
+- url: /_ah/spi/.*
   secure: always
   script: _go_app

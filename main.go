@@ -7,17 +7,59 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/go-endpoints/endpoints"
+
 	"appengine"
 	"appengine/datastore"
+	"appengine/user"
 )
 
+var config = struct {
+	OAuthClientID     string
+	OAuthClientSecret string
+	OAuthRedirectURL  string
+}{}
+
+type SyncService struct{}
+
 func init() {
+	// load config
+	fp, err := os.Open("config.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer fp.Close()
+	if err = json.NewDecoder(fp).Decode(&config); err != nil {
+		log.Fatalf("JSON error decoding config: %v", err)
+	}
+
+	// register debugging API (no authorization, simple JSON request)
 	http.HandleFunc("/api/v1noauth/sync", syncNoAuthHandler)
+
+	// register the endpoints service handler
+	syncService := &SyncService{}
+	api, err := endpoints.RegisterService(syncService, "letmein", "v1", "Letmein Sync Service", true)
+	if err != nil {
+		log.Fatalf("Register service: %v", err)
+	}
+
+	// configure the method
+	method := api.MethodByName("Sync")
+	info := method.Info()
+	info.Name = "sync"
+	info.HTTPMethod = "POST"
+	info.Path = "letmein"
+	info.Desc = "Sync profiles"
+
+	endpoints.HandleHTTP()
 }
 
 const (
@@ -27,6 +69,7 @@ const (
 )
 
 type SyncRecord struct {
+	Email        string    `datastore:"email,noindex"`
 	Verify       string    `datastore:"verify,noindex"`
 	CreatedAt    time.Time `datastore:"created_at,noindex"`
 	ModifiedAt   time.Time `datastore:"modified_at,noindex"`
@@ -38,8 +81,8 @@ type SyncRecord struct {
 }
 
 type Client struct {
-	Name     string     `json:"name" datastore:"-"`
-	Verify   string     `json:"verify" datastore:"-"`
+	Name     string     `json:"name,omitempty" datastore:"-"`
+	Verify   string     `json:"verify,omitempty" datastore:"-"`
 	Profiles []*Profile `json:"profiles,omitempty" datastore:"profiles,noindex"`
 
 	SyncedAt       *time.Time `json:"synced_at,omitempty" datastore:"-"`
@@ -92,31 +135,149 @@ func (elt *Client) Save(c chan<- datastore.Property) error {
 	return nil
 }
 
-var never = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
-
 func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := appengine.NewContext(r)
-	now := time.Now().Round(time.Millisecond)
+	defer r.Body.Close()
+	c := appengine.NewContext(r)
+
+	if r.Method != "POST" {
+		http.Error(w, "non-POST request not found", http.StatusNotFound)
+		return
+	}
 
 	// parse request
 	if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
-		ctx.Errorf("request Content-Type must be application/json")
+		c.Errorf("request Content-Type must be application/json")
 		http.Error(w, "request Content-Type must be application/json", http.StatusBadRequest)
 		return
 	}
 	if !strings.Contains(r.Header.Get("Accept"), "application/json") {
-		ctx.Errorf("Accept header must include application/json")
+		c.Errorf("Accept header must include application/json")
 		http.Error(w, "Accept header must include application/json", http.StatusBadRequest)
 		return
 	}
 	client := new(Client)
-	decoder := json.NewDecoder(r.Body)
-	defer r.Body.Close()
+
+	// grap the entire request body in case we need to log it later
+	body := new(bytes.Buffer)
+	if _, err := io.Copy(body, r.Body); err != nil {
+		c.Errorf("error reading body of request: %v", err)
+		http.Error(w, "error reading body of request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	reqBody := body.String()
+
+	decoder := json.NewDecoder(body)
 	if err := decoder.Decode(client); err != nil {
-		ctx.Errorf("decoding request: %v", err)
+		c.Errorf("decoding request: %v", err)
+		c.Debugf("request body:\n%s", reqBody)
 		http.Error(w, "error decoding request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	response, err := syncCommon(c, client, "", "noauth")
+
+	if err != nil {
+		c.Debugf("request body:\n%s", reqBody)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// write out the JSON response
+	w.Header().Add("Content-Type", "application/json")
+	encoded, err := json.MarshalIndent(response, "", "    ")
+	if err != nil {
+		c.Errorf("Error encoding JSON response: %v", err)
+		http.Error(w, "Error encoding JSON response: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	encoded = append(encoded, '\n')
+	if _, err = w.Write(encoded); err != nil {
+		c.Errorf("Error writing response: %v", err)
+		http.Error(w, "Error writing response: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	c.Debugf("request body:\n%s", reqBody)
+}
+
+/*
+func (s *SyncService) SyncNoAuth(c endpoints.Context, client *Client) (*Client, error) {
+	response, err := syncCommon(c, client, "", "noauth")
+	if err != nil {
+		c.Errorf("%v", err)
+		return nil, err
+	}
+	return response, nil
+}
+*/
+
+func (s *SyncService) Sync(c endpoints.Context, client *Client) (*Client, error) {
+	u, err := endpoints.CurrentBearerTokenUser(c,
+		[]string{endpoints.EmailScope},
+		[]string{config.OAuthClientID, endpoints.APIExplorerClientID})
+	if err != nil {
+		return nil, err
+	}
+	response, err := syncCommon(c, client, u.Email, "")
+	if err != nil {
+		c.Errorf("%v", err)
+		return nil, err
+	}
+	return response, nil
+}
+
+func resetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "non-POST request not found", http.StatusNotFound)
+		return
+	}
+
+	suffix := ""
+
+	ctx := appengine.NewContext(r)
+
+	// get the user
+	u := user.Current(ctx)
+	if u == nil {
+		url, err := user.LoginURL(ctx, r.URL.String())
+		if err != nil {
+			ctx.Errorf("login redirect error: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Location", url)
+		w.WriteHeader(http.StatusFound)
+		return
+	}
+
+	clientKey := u.ID
+	if clientKey == "" {
+		clientKey = u.Email
+	}
+	ctx.Debugf("client key is %q", clientKey)
+
+	topts := &datastore.TransactionOptions{}
+	err := datastore.RunInTransaction(ctx, func(c appengine.Context) error {
+		syncKey := datastore.NewKey(c, "SyncRecord_v1"+suffix, clientKey, 0, nil)
+		profileKey := datastore.NewKey(c, "Profiles_v1"+suffix, clientKey, 0, syncKey)
+		err := datastore.DeleteMulti(c, []*datastore.Key{syncKey, profileKey})
+		if err == datastore.ErrNoSuchEntity {
+			c.Infof("entity not found for reset request: %v", err)
+			return nil
+		} else if err != nil {
+			return err
+		}
+		return nil
+	}, topts)
+	if err != nil {
+		ctx.Errorf("Error in reset transaction: %v", err)
+		http.Error(w, "error handling reset: "+err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func syncCommon(ctx appengine.Context, client *Client, email string, suffix string) (*Client, error) {
+	now := time.Now().Round(time.Millisecond)
+	never := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
 	if client.SyncedAt == nil {
 		client.SyncedAt = &now
 	} else {
@@ -127,22 +288,28 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(client.Verify) == 0 || len(client.Verify) > maxVerifyLen {
-		ctx.Errorf("verify field must be between 1 and %d characters long", maxVerifyLen)
-		http.Error(w, "verify field of invalid length", http.StatusBadRequest)
-		return
+		return nil, fmt.Errorf("verify field must be between 1 and %d characters long", maxVerifyLen)
 	}
 
-	// for now, take the client key to be the Name field
-	clientKey := client.Name
-	ctx.Infof("client key is %q", clientKey)
+	clientKey := email
 
-	// adjust for clock drift, but not if it is too far off
+	// get the ID/email from the request for noauth requests
+	if clientKey == "" {
+		clientKey = client.Name
+		email = client.Name
+	}
+	if clientKey == "" {
+		return nil, fmt.Errorf("unable to determine user ID/Email/Name")
+	}
+	ctx.Debugf("client key is %q", clientKey)
+
+	// adjust all client-supplied timestamps for clock drift
+	// but not if it is too far off
 	delta := now.Sub(*client.SyncedAt)
 	if delta > maxClockDrift || -delta > maxClockDrift {
 		delta = 0
 	} else {
-		// adjust all client-supplied timestamps
-		ctx.Infof("delta %v\n", delta)
+		ctx.Debugf("delta %v\n", delta)
 	}
 
 	// client.PreviousSyncAt came from us, so do not adjust it
@@ -162,9 +329,7 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		elt.SyncedAt = now
 
 		if err := elt.Validate(); err != nil {
-			ctx.Errorf("Invalid profile %s: %v", elt, err)
-			http.Error(w, fmt.Sprintf("Invalid profile: %s: %v", elt, err), http.StatusBadRequest)
-			return
+			return nil, fmt.Errorf("Invalid profile %s: %v", elt, err)
 		}
 
 		// find the latest timestamp
@@ -176,23 +341,22 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 	topts := &datastore.TransactionOptions{}
 	err := datastore.RunInTransaction(ctx, func(c appengine.Context) error {
 		// start with the sync record
-		syncKey := datastore.NewKey(c, "SyncRecord_v1noauth", clientKey, 0, nil)
+		syncKey := datastore.NewKey(c, "SyncRecord_v1"+suffix, clientKey, 0, nil)
 		sync := new(SyncRecord)
 		if err := datastore.Get(c, syncKey, sync); err != nil {
 			if err != datastore.ErrNoSuchEntity {
-				c.Errorf("DB error getting client sync record: %v", err)
-				return err
+				return fmt.Errorf("DB error getting client sync record: %v", err)
 			}
 
 			// special case: new client
 			// if this is not a first sync, reject the request
 			if client.PreviousSyncAt != nil {
-				c.Infof("No client record found, but client is reporting an earlier sync. Rejecting request.")
 				return fmt.Errorf("Client record not found, but your request was for a partial sync")
 			}
 
 			c.Infof("new client sync record")
 			sync = &SyncRecord{
+				Email:        email,
 				Verify:       client.Verify,
 				CreatedAt:    now,
 				ModifiedAt:   never,
@@ -208,6 +372,10 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 			c.Infof("verify mismatch: client says %s, expecting %s", client.Verify, sync.Verify)
 			return errors.New("Verify mismatch: check master password")
 		}
+		if sync.Email != email {
+			c.Infof("email mismatch: was %s, updating to %s", sync.Email, email)
+			sync.Email = email
+		}
 
 		sync.AccessedAt = now
 		sync.AccessCount++
@@ -216,8 +384,7 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		if len(client.Profiles) == 0 && client.PreviousSyncAt != nil && client.PreviousSyncAt.After(sync.ModifiedAt) {
 			// write back the sync record and quit
 			if _, err := datastore.Put(c, syncKey, sync); err != nil {
-				c.Errorf("DB error putting client sync record: %v", err)
-				return err
+				return fmt.Errorf("DB error putting client sync record: %v", err)
 			}
 
 			// tell the client not to make any changes
@@ -230,12 +397,11 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// fetch the user's profile list
-		profileKey := datastore.NewKey(c, "Profiles_v1noauth", clientKey, 0, syncKey)
+		profileKey := datastore.NewKey(c, "Profiles_v1"+suffix, clientKey, 0, syncKey)
 		server := new(Client)
 		if err := datastore.Get(c, profileKey, server); err != nil {
 			if err != datastore.ErrNoSuchEntity {
-				c.Errorf("DB error getting client record: %v", err)
-				return err
+				return fmt.Errorf("DB error getting client record: %v", err)
 			}
 
 			// special case: new client
@@ -343,13 +509,11 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		server.Profiles = serverResult
 
 		if _, err := datastore.Put(c, syncKey, sync); err != nil {
-			c.Errorf("DB error putting client sync record: %v", err)
-			return err
+			return fmt.Errorf("DB error putting client sync record: %v", err)
 		}
 		if modified {
 			if _, err := datastore.Put(c, profileKey, server); err != nil {
-				c.Errorf("DB error putting profiles: %v", err)
-				return err
+				return fmt.Errorf("DB error putting profiles: %v", err)
 			}
 		} else {
 			c.Infof("no changes to profile list; skipping profile write")
@@ -366,29 +530,8 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}, topts)
 	if err != nil {
-		ctx.Errorf("Error in syncNoAuthHandler transaction: %v", err)
-		http.Error(w, "error handling sync: "+err.Error(), http.StatusInternalServerError)
-		return
+		return nil, fmt.Errorf("error in sync transaction: %v", err)
 	}
 
-	// write out the JSON response
-	w.Header().Add("Content-Type", "application/json")
-	encoded, err := json.MarshalIndent(client, "", "    ")
-	if err != nil {
-		ctx.Errorf("Error encoding JSON response: %v", err)
-		http.Error(w, "Error encoding JSON response: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	encoded = append(encoded, '\n')
-	if _, err = w.Write(encoded); err != nil {
-		ctx.Errorf("Error writing response: %v", err)
-		http.Error(w, "Error writing response: "+err.Error(), http.StatusInternalServerError)
-	}
-
-	/*
-		encoder := json.NewEncoder(w)
-		if err := encoder.Encode(client); err != nil {
-			ctx.Errorf("Error writing/encoding response: %v", err)
-		}
-	*/
+	return client, nil
 }
