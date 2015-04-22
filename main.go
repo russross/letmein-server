@@ -23,9 +23,7 @@ import (
 )
 
 var config = struct {
-	OAuthClientID     string
-	OAuthClientSecret string
-	OAuthRedirectURL  string
+	OAuthClientID string
 }{}
 
 type SyncService struct{}
@@ -80,7 +78,7 @@ type SyncRecord struct {
 	DeletedCount int       `datastore:"deleted_count,noindex"`
 }
 
-type Client struct {
+type SyncRequest struct {
 	Name     string     `json:"name,omitempty" datastore:"-"`
 	Verify   string     `json:"verify,omitempty" datastore:"-"`
 	Profiles []*Profile `json:"profiles,omitempty" datastore:"profiles,noindex"`
@@ -89,7 +87,7 @@ type Client struct {
 	PreviousSyncAt *time.Time `json:"previous_sync_at,omitempty" datastore:"-"`
 }
 
-func (elt *Client) Load(c <-chan datastore.Property) error {
+func (elt *SyncRequest) Load(c <-chan datastore.Property) error {
 	// make sure channel is properly drained
 	defer func() {
 		for _ = range c {
@@ -117,7 +115,7 @@ func (elt *Client) Load(c <-chan datastore.Property) error {
 	return nil
 }
 
-func (elt *Client) Save(c chan<- datastore.Property) error {
+func (elt *SyncRequest) Save(c chan<- datastore.Property) error {
 	defer close(c)
 
 	buf := new(bytes.Buffer)
@@ -155,7 +153,7 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Accept header must include application/json", http.StatusBadRequest)
 		return
 	}
-	client := new(Client)
+	client := new(SyncRequest)
 
 	// grap the entire request body in case we need to log it later
 	body := new(bytes.Buffer)
@@ -199,18 +197,7 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 	c.Debugf("request body:\n%s", reqBody)
 }
 
-/*
-func (s *SyncService) SyncNoAuth(c endpoints.Context, client *Client) (*Client, error) {
-	response, err := syncCommon(c, client, "", "noauth")
-	if err != nil {
-		c.Errorf("%v", err)
-		return nil, err
-	}
-	return response, nil
-}
-*/
-
-func (s *SyncService) Sync(c endpoints.Context, client *Client) (*Client, error) {
+func (s *SyncService) Sync(c endpoints.Context, client *SyncRequest) (*SyncRequest, error) {
 	u, err := endpoints.CurrentBearerTokenUser(c,
 		[]string{endpoints.EmailScope},
 		[]string{config.OAuthClientID, endpoints.APIExplorerClientID})
@@ -274,10 +261,15 @@ func resetHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func syncCommon(ctx appengine.Context, client *Client, email string, suffix string) (*Client, error) {
+// syncCommon does most of the work of syncing profiles.
+// It is called by the noauth handler as well as the main endpoints API handler.
+func syncCommon(ctx appengine.Context, client *SyncRequest, email string, suffix string) (*SyncRequest, error) {
 	now := time.Now().Round(time.Millisecond)
 	never := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 
+	// round all timestamps to the nearest millisecond
+	// to avoid confusing Java and JavaScript clients that
+	// prefer millisecond precision
 	if client.SyncedAt == nil {
 		client.SyncedAt = &now
 	} else {
@@ -287,10 +279,13 @@ func syncCommon(ctx appengine.Context, client *Client, email string, suffix stri
 		*client.PreviousSyncAt = client.PreviousSyncAt.Round(time.Millisecond)
 	}
 
+	// check for sane verify field
 	if len(client.Verify) == 0 || len(client.Verify) > maxVerifyLen {
 		return nil, fmt.Errorf("verify field must be between 1 and %d characters long", maxVerifyLen)
 	}
 
+	// we track clients by email address normally, but in the noauth version
+	// we accept a tracking key from the client
 	clientKey := email
 
 	// get the ID/email from the request for noauth requests
@@ -309,7 +304,7 @@ func syncCommon(ctx appengine.Context, client *Client, email string, suffix stri
 	if delta > maxClockDrift || -delta > maxClockDrift {
 		delta = 0
 	} else {
-		ctx.Debugf("delta %v\n", delta)
+		ctx.Debugf("time delta %v\n", delta)
 	}
 
 	// client.PreviousSyncAt came from us, so do not adjust it
@@ -332,12 +327,13 @@ func syncCommon(ctx appengine.Context, client *Client, email string, suffix stri
 			return nil, fmt.Errorf("Invalid profile %s: %v", elt, err)
 		}
 
-		// find the latest timestamp
+		// find the latest timestamp from all the profiles the client supplied
 		if modifiedAt == nil || modifiedAt.Before(*elt.ModifiedAt) {
 			modifiedAt = elt.ModifiedAt
 		}
 	}
 
+	// run the main sync operation in a transaction
 	topts := &datastore.TransactionOptions{}
 	err := datastore.RunInTransaction(ctx, func(c appengine.Context) error {
 		// start with the sync record
@@ -351,7 +347,7 @@ func syncCommon(ctx appengine.Context, client *Client, email string, suffix stri
 			// special case: new client
 			// if this is not a first sync, reject the request
 			if client.PreviousSyncAt != nil {
-				return fmt.Errorf("Client record not found, but your request was for a partial sync")
+				return fmt.Errorf("SyncRequest record not found, but your request suggests this is not the first sync (PreviousSyncAt is not nil)")
 			}
 
 			c.Infof("new client sync record")
@@ -368,11 +364,12 @@ func syncCommon(ctx appengine.Context, client *Client, email string, suffix stri
 			}
 		}
 
+		// insist on a verify field match
 		if client.Verify != sync.Verify {
 			c.Infof("verify mismatch: client says %s, expecting %s", client.Verify, sync.Verify)
 			return errors.New("Verify mismatch: check master password")
 		}
-		if sync.Email != email {
+		if sync.Email != email && email != "" {
 			c.Infof("email mismatch: was %s, updating to %s", sync.Email, email)
 			sync.Email = email
 		}
@@ -398,7 +395,7 @@ func syncCommon(ctx appengine.Context, client *Client, email string, suffix stri
 
 		// fetch the user's profile list
 		profileKey := datastore.NewKey(c, "Profiles_v1"+suffix, clientKey, 0, syncKey)
-		server := new(Client)
+		server := new(SyncRequest)
 		if err := datastore.Get(c, profileKey, server); err != nil {
 			if err != datastore.ErrNoSuchEntity {
 				return fmt.Errorf("DB error getting client record: %v", err)
@@ -406,7 +403,7 @@ func syncCommon(ctx appengine.Context, client *Client, email string, suffix stri
 
 			// special case: new client
 			c.Infof("new client record")
-			server = &Client{
+			server = &SyncRequest{
 				Profiles: []*Profile{},
 			}
 		}
@@ -491,6 +488,7 @@ func syncCommon(ctx appengine.Context, client *Client, email string, suffix stri
 				}
 			}
 
+			// everything gets saved on the server
 			serverResult = append(serverResult, merged)
 			if merged.IsDeleted() {
 				deletedCount++
