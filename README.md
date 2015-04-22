@@ -10,7 +10,7 @@ path, and you have Go set up for normal development.
 
 Download this package:
 
-    goapp get github.com/russross/letmeinserver
+    goapp get github.com/russross/letmein-server
 
 Customize it. Create a new App Engine project and note the ID that
 you use:
