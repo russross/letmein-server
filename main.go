@@ -23,7 +23,8 @@ import (
 )
 
 var config = struct {
-	OAuthClientID string
+	OAuthClientID  string
+	OAuthAndroidID string
 }{}
 
 type SyncService struct{}
@@ -200,7 +201,7 @@ func syncNoAuthHandler(w http.ResponseWriter, r *http.Request) {
 func (s *SyncService) Sync(c endpoints.Context, client *SyncRequest) (*SyncRequest, error) {
 	u, err := endpoints.CurrentBearerTokenUser(c,
 		[]string{endpoints.EmailScope},
-		[]string{config.OAuthClientID, endpoints.APIExplorerClientID})
+		[]string{config.OAuthClientID, config.OAuthAndroidID, endpoints.APIExplorerClientID})
 	if err != nil {
 		return nil, err
 	}
